@@ -2,7 +2,7 @@
 // Overview
 // - Single-file C++17 implementation for clarity and portability.
 // - Implements a quadtree (Barnes–Hut) to approximate long-range gravity.
-// - Leapfrog / Velocity-Verlet integrator for good long-term energy behavior.
+// - Leapfrog / Velocity-Verlet ("midpoint Verlet") integrator for good long-term energy behavior.
 // - Optional CSV and PPM frame output for lightweight visualization.
 // - Built-in test modes for quick validation.
 //
@@ -80,54 +80,7 @@
 #include <fstream>
 #include <string>
 #include <sstream>
-// Filesystem compatibility: prefer C++17 <filesystem>, fallback to <experimental/filesystem>,
-// and finally a tiny POSIX/Win32 mkdir-based helper if neither is available.
-#if defined(__has_include)
-#  if __has_include(<filesystem>) && (__cplusplus >= 201703L)
-#    include <filesystem>
-     namespace fs = std::filesystem;
-#  elif __has_include(<experimental/filesystem>)
-#    include <experimental/filesystem>
-     namespace fs = std::experimental::filesystem;
-#  else
-#    include <sys/stat.h>
-#    include <sys/types.h>
-#    if defined(_WIN32)
-#      include <direct.h>
-#    endif
-#    include <cerrno>
-#    include <cstring>
-     namespace fs {
-         inline bool create_directories(const std::string& path) {
-             if (path.empty()) return true;
-             std::string cur;
-             cur.reserve(path.size());
-             auto mk = [&](const std::string& p) -> bool {
-#if defined(_WIN32)
-                 int rc = _mkdir(p.c_str());
-#else
-                 int rc = mkdir(p.c_str(), 0755);
-#endif
-                 return (rc == 0) || (rc != 0 && errno == EEXIST);
-             };
-             for (char c : path) {
-                 cur.push_back(c);
-                 if (c == '/' || c == '\\') {
-                     if (!mk(cur)) return false;
-                 }
-             }
-             // Final component (if path did not end with separator)
-             if (!cur.empty() && cur.back() != '/' && cur.back() != '\\') {
-                 if (!mk(cur)) return false;
-             }
-             return true;
-         }
-     }
-#  endif
-#else
-#  include <filesystem>
-   namespace fs = std::filesystem;
-#endif
+#include <filesystem>
 
 // 2D vector with minimal arithmetic used throughout the simulation.
 // The operators are intentionally small and inlined for readability, not micro-optimization.
@@ -481,8 +434,6 @@ static std::vector<Body> makeTwoBodyOrbit(double r = 1.0, double m1 = 1.0, doubl
 }
 
 // Potential energy (softened) for diagnostics/energy drift checks.
-// We use the same softening as in the force to remain consistent. Pairwise
-// potential is -G m_i m_j / sqrt(r^2 + eps^2), summed over i<j to avoid double counting.
 static double potentialEnergy(const std::vector<Body>& bodies, double G, double softening) {
     const double soft2 = softening * softening;
     double pe = 0.0;
@@ -501,7 +452,7 @@ static double potentialEnergy(const std::vector<Body>& bodies, double G, double 
 // CSV writer for a single frame: id,x,y,vx,vy,m
 // Useful for plotting with Python/gnuplot or quick-inspecting trajectories.
 static void writeCSVFrame(const std::string& dir, int step, const std::vector<Body>& bodies) {
-    fs::create_directories(dir);
+    std::filesystem::create_directories(dir);
     std::ostringstream name;
     name << dir << "/frame_" << std::setw(6) << std::setfill('0') << step << ".csv";
     std::ofstream os(name.str());
@@ -515,14 +466,9 @@ static void writeCSVFrame(const std::string& dir, int step, const std::vector<Bo
 
 // Simple grayscale PPM (P6) renderer with a 3x3 splat kernel.
 // World coordinates are mapped linearly to the image plane within [-bound, bound]^2.
-// Implementation notes:
-//   - We accumulate into 16-bit integers to reduce saturation artifacts when many
-//     masses overlap a pixel, then rescale to 0..255 at the end.
-//   - The output is binary PPM (magic P6), which most image viewers can open.
-//   - This is purely illustrative and not physically accurate rendering.
 static void writePPMFrame(const std::string& dir, int step, const std::vector<Body>& bodies,
                           int W, int H, double bound) {
-    fs::create_directories(dir);
+    std::filesystem::create_directories(dir);
     std::ostringstream name;
     name << dir << "/frame_" << std::setw(6) << std::setfill('0') << step << ".ppm";
 
@@ -553,10 +499,7 @@ static void writePPMFrame(const std::string& dir, int step, const std::vector<Bo
     for (const auto& b : bodies) {
         // Clip bodies outside the view bounds to avoid out-of-range pixels.
         if (std::abs(b.pos.x) > bound || std::abs(b.pos.y) > bound) continue;
-        // Avoid structured bindings to be friendly with pre-C++17 toolchains.
-        auto pix = toPixel(b.pos);
-        int px = pix.first;
-        int py = pix.second;
+        auto [px, py] = toPixel(b.pos);
         splat(px, py, b.mass);
     }
 
@@ -581,8 +524,6 @@ static void writePPMFrame(const std::string& dir, int step, const std::vector<Bo
 }
 
 // Compute direct-sum accelerations (O(N^2)) for testing/validation against BH approximation.
-// This is only practical for small N, but gives an unbiased reference to measure
-// approximation error from theta-based node acceptance.
 static std::vector<Vec2> directAccelerations(const std::vector<Body>& bodies, double G, double softening) {
     const int n = static_cast<int>(bodies.size());
     std::vector<Vec2> acc(n, {0.0, 0.0});
@@ -625,8 +566,6 @@ static void testBHError(unsigned seed, double theta, int n = 64) {
     // Direct accelerations
     auto acc_ref = directAccelerations(bodies, P.G, P.softening);
 
-    // Report mean and max relative error: ||a_BH - a_ref|| / ||a_ref||.
-    // We add a tiny epsilon when normalizing to avoid division by zero for tiny accelerations.
     double maxRel = 0.0, meanRel = 0.0;
     int count = 0;
     for (int i = 0; i < n; ++i) {
@@ -653,8 +592,6 @@ static void testTwoBodyEnergyDrift() {
     for (int s = 0; s < P.steps; ++s) stepBH(bodies, P);
     const double E1 = kineticEnergy(bodies) + potentialEnergy(bodies, P.G, P.softening);
     const double rel = std::abs((E1 - E0) / (std::abs(E0) + 1e-15));
-    // A well-configured velocity-Verlet with reasonable dt and theta should yield
-    // very small drift here, demonstrating good long-term stability.
     std::cout << "steps=" << P.steps << ", dt=" << P.dt << ", theta=" << P.theta
               << ", rel energy change=" << rel << "\n";
 }
@@ -678,15 +615,6 @@ int main(int argc, char** argv) {
     if (argc >= 5) P.theta = std::max(0.1, std::atof(argv[4]));
 
     // Parse named flags. Unknown flags are ignored silently for brevity.
-    // Flags:
-    //   --seed <u32>         RNG seed for reproducible initial conditions
-    //   --csv [--csv-dir d]  Write CSV frames to directory d (default out_csv)
-    //   --ppm [--ppm-dir d]  Write PPM frames to directory d (default out_ppm)
-    //   --ppm-size WxH       Set PPM resolution (default 800x800)
-    //   --render-every k     Output every k steps (default 10)
-    //   --bound half         World half-extent mapped to image (default 3.0)
-    //   --test               Run built-in tests and exit
-    //   --test-theta val     Theta used in error test (default 0.5)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -740,8 +668,7 @@ int main(int argc, char** argv) {
     for (int s = 0; s < P.steps; ++s) {
         stepBH(bodies, P);
 
-        // Periodic logging: kinetic energy (coarse health check), center of mass (drift),
-        // and the first body's position for a quick sanity snapshot.
+        // Periodic logging
         if ((s % 50) == 0 || s == P.steps - 1) {
             const double ke = kineticEnergy(bodies);
             const Vec2 com = centerOfMass(bodies);
